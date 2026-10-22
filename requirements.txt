@@ -1,0 +1,17 @@
+# torch 建議先另外安裝 CPU 版：pip install --index-url https://download.pytorch.org/whl/cpu torch
+torch>=2.2
+streamlit>=1.50
+streamlit-folium>=0.27
+folium>=0.20
+plotly>=6.0
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+scikit-learn>=1.5
+rasterio>=1.4
+geopandas>=1.0
+pyogrio>=0.10
+pystac-client>=0.8
+planetary-computer>=1.0
+pillow>=10.0
+matplotlib>=3.9
