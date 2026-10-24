@@ -15,7 +15,7 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
@@ -109,12 +109,12 @@ def village_mask(geom_3826, grid: Grid) -> np.ndarray:
 
 # ============ STAC 讀取 ============
 
-def search_items(geom_4326, year: int):
+def search_items(geom_4326, start: date, end: date):
     catalog = pystac_client.Client.open(STAC_URL, modifier=planetary_computer.sign_inplace)
     search = catalog.search(
         collections=[COLLECTION],
         intersects=geom_4326.__geo_interface__,
-        datetime=f"{year}-01-01/{year}-12-31",
+        datetime=f"{start.isoformat()}/{end.isoformat()}",
         query={"eo:cloud_cover": {"lt": MAX_SCENE_CLOUD}},
     )
     items = list(search.items())
@@ -155,7 +155,13 @@ def boa_offset(item) -> float:
 
 
 def nominal_slot_dates(year: int):
-    return [date(year, int(d[4:6]), int(d[6:8])) for d in S2_DATES_2023]
+    """
+    前一年最後 SEQ_LEN 期 + 當年 30 期。
+    前置期別作為 LSTM 輸入視窗，使當年第 1 期起即有預測（一期作插秧期才看得到）
+    """
+    this_year = [date(year, int(d[4:6]), int(d[6:8])) for d in S2_DATES_2023]
+    prev_year = [date(year - 1, int(d[4:6]), int(d[6:8])) for d in S2_DATES_2023[-SEQ_LEN:]]
+    return prev_year + this_year
 
 
 def assign_slots(acq_df: pd.DataFrame, slot_dates, clear_thr: float):
@@ -181,7 +187,7 @@ def load_village_cube(village: str, year: int, clear_thr: float, progress=None):
     回傳 dict：
       cube       (T, 4, H, W) float32 反射率 [B02, B03, B04, B08]，雲遮像素 = NaN，無影像期別整期 NaN
                  （網格為村里外擴 GRID_BUFFER 之矩形，村里範圍見 vmask）
-      slot_dates 名目期別日期、slot_acq 實際採用影像日期（None = 該期無可用影像）
+      slot_dates 名目期別日期（前 n_pre 期為前一年）、slot_acq 實際採用影像日期（None = 該期無可用影像）
       acq_df     所有搜尋到之影像日期與晴空比例
     """
     report = progress or (lambda frac, msg: None)
@@ -193,8 +199,10 @@ def load_village_cube(village: str, year: int, clear_thr: float, progress=None):
     vmask = village_mask(geom_3826, grid)
     n_village = int(vmask.sum())
 
+    slot_dates = nominal_slot_dates(year)
     report(0.02, "查詢 Sentinel-2 影像清單…")
-    by_date = search_items(geom_4326, year)
+    by_date = search_items(geom_4326, slot_dates[0] - timedelta(days=MAX_SLOT_DAYS),
+                           date(year, 12, 31))
     if not by_date:
         raise RuntimeError(f"{year} 年查無涵蓋 {village} 之 Sentinel-2 影像")
 
@@ -224,12 +232,11 @@ def load_village_cube(village: str, year: int, clear_thr: float, progress=None):
     acq_df = pd.DataFrame(records)
 
     # 2) 期別配對
-    slot_dates = nominal_slot_dates(year)
     slot_acq = assign_slots(acq_df, slot_dates, clear_thr)
 
     # 當年度尚未結束：截斷至最後一期有影像之期別
     last = max((i for i, a in enumerate(slot_acq) if a is not None), default=-1)
-    if last < SEQ_LEN:
+    if last < SEQ_LEN + 1:
         raise RuntimeError("可用期別太少（雲遮門檻可能太嚴格，或該年影像尚不足），無法進行 LSTM 預測")
     slot_dates = slot_dates[: last + 1]
     slot_acq = slot_acq[: last + 1]
@@ -269,7 +276,39 @@ def load_village_cube(village: str, year: int, clear_thr: float, progress=None):
         "vmask": vmask,
         "grid": grid,
         "geom_4326": geom_4326,
+        "village": village,
+        "year": year,
+        "n_pre": SEQ_LEN,      # slot_dates 前 n_pre 期屬前一年，僅作輸入視窗
     }
+
+
+# ============ 本機快取（預先計算之展示資料） ============
+
+CACHE_DIR = APP_DIR / "cache"
+
+
+def cache_path(village: str, year: int, clear_thr: float) -> Path:
+    return CACHE_DIR / f"{village}_{year}_clear{int(round(clear_thr * 100))}.pkl.gz"
+
+
+def summary_path(village: str, year: int) -> Path:
+    return CACHE_DIR / f"{village}_{year}_summary.json"
+
+
+def save_cache(data: dict, path: Path):
+    import gzip, pickle
+    path.parent.mkdir(parents=True, exist_ok=True)
+    slim = dict(data, cube=data["cube"].astype(np.float16))
+    with gzip.open(path, "wb", compresslevel=3) as f:
+        pickle.dump(slim, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_cache(path: Path) -> dict:
+    import gzip, pickle
+    with gzip.open(path, "rb") as f:
+        data = pickle.load(f)
+    data["cube"] = data["cube"].astype(np.float32)
+    return data
 
 
 # ============ 指數計算 ============
@@ -359,19 +398,31 @@ def phenology_features(ndvi_filled: np.ndarray) -> np.ndarray:
                      rising, falling, max_t / T], axis=1).astype(np.float32)
 
 
-def suggest_rice_clusters(mean_curves: np.ndarray):
+def suggest_rice_clusters(mean_curves: np.ndarray, counts=None, fallback: bool = True):
     """
-    依群集平均 NDVI 曲線建議水稻群集：
-    「淹水低點 → 陡升 → 峰值」→ 振幅大、峰值高、低點在峰值之前
+    依群集平均 NDVI 曲線建議水稻群集：「淹水低點 → 陡升 → 峰值」
+      - 峰值 ≥ 0.55
+      - 峰值之前的最低點到峰值上升 ≥ 0.3（收割後 NDVI 可能比淹水期更低，故不以全季最低點判斷）
+      - 群集像素數 ≥ 總數 1%（排除雜訊小群集）
     """
     amp = np.nanmax(mean_curves, 1) - np.nanmin(mean_curves, 1)
-    peak = np.nanmax(mean_curves, 1)
-    order_ok = np.nanargmin(mean_curves, 1) < np.nanargmax(mean_curves, 1)
-    picks = [k for k in range(len(mean_curves)) if amp[k] >= 0.3 and peak[k] >= 0.55 and order_ok[k]]
-    return picks or [int(np.argmax(amp))]
+    picks = []
+    for k, curve in enumerate(mean_curves):
+        t_peak = int(np.nanargmax(curve))
+        before = curve[:t_peak]
+        if t_peak == 0 or np.isnan(before).all():
+            continue
+        rise = curve[t_peak] - np.nanmin(before)
+        big_enough = counts is None or counts[k] >= 0.01 * np.sum(counts)
+        if curve[t_peak] >= 0.55 and rise >= 0.3 and big_enough:
+            picks.append(k)
+    if picks or not fallback:
+        return picks
+    return [int(np.argmax(amp))]
 
 
-def cluster_village(ndvi: np.ndarray, vmask: np.ndarray, season_idx, n_clusters: int, seed: int = 42):
+def cluster_village(ndvi: np.ndarray, vmask: np.ndarray, season_idx, n_clusters: int, seed: int = 42,
+                    fallback: bool = True):
     """
     ndvi: (T, H, W)；season_idx: 用於分群之期別索引
     回傳 labels_map (H, W，-1 = 範圍外/無法計算)、各群集平均曲線、建議水稻群集
@@ -393,7 +444,7 @@ def cluster_village(ndvi: np.ndarray, vmask: np.ndarray, season_idx, n_clusters:
     raw = series[ok]
     mean_curves = np.stack([np.nanmean(raw[labels == k], axis=0) for k in range(n_clusters)])
     counts = np.bincount(labels, minlength=n_clusters)
-    return labels_map, mean_curves, counts, suggest_rice_clusters(mean_curves)
+    return labels_map, mean_curves, counts, suggest_rice_clusters(mean_curves, counts, fallback)
 
 
 # ============ LSTM 物候預測 ============

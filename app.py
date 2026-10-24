@@ -8,7 +8,7 @@
 import base64
 import json
 import io
-from datetime import date
+from datetime import date, timedelta
 
 import folium
 import numpy as np
@@ -20,6 +20,7 @@ from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from streamlit_folium import st_folium
 
+import insights as I
 import pipeline as P
 
 st.set_page_config(page_title="霧峰區水稻物候 Demo", page_icon="🌾", layout="wide")
@@ -27,20 +28,31 @@ st.set_page_config(page_title="霧峰區水稻物候 Demo", page_icon="🌾", la
 CLUSTER_COLORS = ["#E45756", "#4C78A8", "#F58518", "#72B7B2", "#54A24B",
                   "#B279A2", "#FF9DA6", "#9D755D"]
 CLOUD_RGBA = (255, 64, 160, 150)
-SEASONS = {"一期作（1–6 月）": (1, 6), "二期作（7–12 月）": (7, 12)}
+PX_HA = P.GRID_RES ** 2 / 1e4
+PATTERN_NAMES = ["僅一期作", "僅二期作", "兩期皆種"]
+PATTERN_COLORS = ["#F2C14E", "#5AB4E5", "#1E7B34"]
+ANOMALY_NAMES = {1: "生長落後", 2: "生長提前", 3: "生長勢偏弱", 4: "未進入成熟期"}
+ANOMALY_COLORS = ["#E53935", "#8E24AA", "#FB8C00", "#3949AB"]
 
 
 # ============ 快取：只存在記憶體 ============
 
 def get_cube(village, year, clear_thr):
-    """影像資料存於本 session 記憶體（含進度條，不適用 st.cache_data 重播機制）"""
+    """影像資料存於本 session 記憶體；有預先計算之快取時直接載入（展示模式）"""
     store = st.session_state.setdefault("cubes", {})
     key = (village, year, clear_thr)
     if key not in store:
-        bar = st.progress(0.0, text="準備中…")
-        data = P.load_village_cube(village, year, clear_thr,
-                                   progress=lambda f, m: bar.progress(min(f, 1.0), text=m))
-        bar.empty()
+        path = P.cache_path(village, year, clear_thr)
+        if path.exists():
+            with st.spinner("載入預先計算之影像時序…"):
+                data = P.load_cache(path)
+            data["source"] = "預先計算（展示模式）"
+        else:
+            bar = st.progress(0.0, text="準備中…")
+            data = P.load_village_cube(village, year, clear_thr,
+                                       progress=lambda f, m: bar.progress(min(f, 1.0), text=m))
+            bar.empty()
+            data["source"] = "即時讀取 Planetary Computer"
         ndvi, ndwi, rvi = P.spectral_indices(data["cube"])
         data.update(ndvi=ndvi, ndwi=ndwi, rvi=rvi)
         while len(store) >= 2:
@@ -50,13 +62,8 @@ def get_cube(village, year, clear_thr):
 
 
 @st.cache_data(show_spinner="K-means 分群中…", max_entries=8)
-def cached_clusters(village, year, clear_thr, season, k, _data):
-    m0, m1 = SEASONS[season]
-    idx = [i for i, d in enumerate(_data["slot_dates"]) if m0 <= d.month <= m1]
-    if len(idx) < 3:
-        raise RuntimeError("所選期作內可用期別不足 3 期，無法分群")
-    labels_map, curves, counts, suggested = P.cluster_village(_data["ndvi"], _data["vmask"], idx, k)
-    return idx, labels_map, curves, counts, suggested
+def cached_clusters(village, year, clear_thr, k, _data):
+    return I.cluster_seasons(_data, k)
 
 
 @st.cache_resource
@@ -65,15 +72,27 @@ def cached_model():
 
 
 @st.cache_data(show_spinner="LSTM 物候階段預測中…", max_entries=8)
-def cached_stages(village, year, clear_thr, season, k, rice_ids, _data, _labels_map):
-    rows, cols = np.where(np.isin(_labels_map, rice_ids))
-    series = P.build_s2_month_series(_data["ndvi"], _data["ndwi"], _data["rvi"],
-                                     rows, cols, _data["slot_dates"])
-    preds = P.predict_stages(cached_model(), series)
-    H, W = _labels_map.shape
-    stage_maps = np.full((preds.shape[0], H, W), 255, dtype=np.uint8)
-    stage_maps[:, rows, cols] = preds
-    return stage_maps
+def cached_analysis(village, year, clear_thr, k, rice_key, _data, _clusters):
+    return I.analyze(_data, _clusters, dict(rice_key), cached_model())
+
+
+def load_summary(village, year):
+    path = P.summary_path(village, year)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+@st.cache_data(show_spinner="以截至當日之資料重新預測…", max_entries=16)
+def cached_asof(village, year, clear_thr, k, rice_key, season, asof, _data, _ana):
+    prev = load_summary(village, year - 1)
+    prior = prev["seasons"].get(season, {}).get("durations") if prev else None
+    return I.asof_forecast(_data, _ana, season, asof, cached_model(), prior)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_anomalies(village, year, clear_thr, k, rice_key, season, _data, _ana):
+    return I.anomaly_patches(_ana["cal"][season], _ana["peak"][season], _ana["in_season"][season],
+                             _ana["complete"][season], _ana["rows"], _ana["cols"], _data)
+
 
 
 # ============ 地圖輔助 ============
@@ -145,33 +164,37 @@ def nearest_image_slot(i, slot_acq, slot_dates):
 
 
 @st.cache_data(show_spinner="產生各期圖層…", max_entries=8)
-def build_player_frames(village, year, clear_thr, season, k, rice_ids, _data, _stage_maps):
+def build_player_frames(village, year, clear_thr, k, rice_key, _data, _ana):
     """預先產生每一預測期別之分類圖與當期影像（data URL），供前端播放器切換"""
     slot_dates, slot_acq, vmask = _data["slot_dates"], _data["slot_acq"], _data["vmask"]
-    rice_mask = _stage_maps[0] != 255
-    n_rice = max(int(rice_mask.sum()), 1)
+    rows, cols, pred, n_pre = _ana["rows"], _ana["cols"], _ana["pred"], _data["n_pre"]
+    n_rice = max(len(rows), 1)
+    H, W = vmask.shape
     img_cache = {}
     frames, bounds = [], None
-    for j, sm in enumerate(_stage_maps):
-        slot = j + P.SEQ_LEN
+    for j in range(pred.shape[0]):
+        sm = np.full((H, W), 255, dtype=np.uint8)
+        sm[rows, cols] = pred[j]
+        slot = j + n_pre
         img_slot = slot if slot_acq[slot] is not None else nearest_image_slot(slot, slot_acq, slot_dates)
         if img_slot not in img_cache:
             img_cache[img_slot], _ = to_overlay(true_color_rgba(_data["cube"][img_slot], vmask),
                                                 _data["grid"], fmt="WEBP")
         stage_url, bounds = to_overlay(categorical_rgba(sm, P.STAGE_COLORS, 255), _data["grid"])
-        px = [int((sm[rice_mask] == s).sum()) for s in range(4)]
+        px = [int((pred[j] == s).sum()) for s in range(4)]
         frames.append({
-            "label": f"T{slot + 1}",
+            "label": f"T{j + 1}",
             "date": str(slot_dates[slot]),
             "acq": str(slot_acq[img_slot]),
             "interp": slot_acq[slot] is None,
             "stage": stage_url,
             "image": img_cache[img_slot],
             "px": px,
-            "ha": [round(p * P.GRID_RES ** 2 / 1e4, 1) for p in px],
+            "ha": [round(p * PX_HA, 1) for p in px],
             "pct": [round(p / n_rice * 100, 1) for p in px],
         })
     return {"frames": frames, "bounds": bounds}
+
 
 
 def player_html(player, geom):
@@ -319,6 +342,40 @@ def legend(items):
     st.markdown(html, unsafe_allow_html=True)
 
 
+
+def date_rgba(ord_map, cmap="Viridis"):
+    """日期序數圖 → 依日期先後著色；回傳 (rgba, [(日期字串, 顏色), ...])"""
+    from plotly.colors import sample_colorscale
+    vals = np.unique(ord_map[ord_map >= 0]).astype(int)
+    out = np.zeros(ord_map.shape + (4,), dtype=np.uint8)
+    if len(vals) == 0:
+        return out, []
+    colors = sample_colorscale(cmap, np.linspace(0, 1, len(vals)) if len(vals) > 1 else [0.5])
+    items = []
+    for v, c in zip(vals, colors):
+        rgb = tuple(int(float(x)) for x in c[c.index("(") + 1:-1].split(","))
+        out[ord_map == v] = (*rgb, 255)
+        items.append((date.fromordinal(v).strftime("%m/%d"), f"rgb{rgb}"))
+    return out, items
+
+
+def to_grid(values, rows, cols, shape, fill=-1, dtype=float):
+    g = np.full(shape, fill, dtype=dtype)
+    g[rows, cols] = values
+    return g
+
+
+def planted_mask(ana, season):
+    cal = ana["cal"][season]
+    return ana["in_season"][season] & ((cal["生殖生長"] >= 0) | (cal["抽穗"] >= 0))
+
+
+def week_bars(fig, df, name, color, opacity=1.0):
+    if len(df):
+        fig.add_bar(x=df["week"], y=df["ha"], name=name, marker_color=color, opacity=opacity,
+                    hovertemplate="%{x|%m/%d} 當週：%{y:.1f} ha<extra>" + name + "</extra>")
+
+
 # ============ 側欄 ============
 
 villages = P.load_villages()
@@ -328,135 +385,281 @@ this_year = date.today().year
 with st.sidebar:
     st.header("🌾 參數設定")
     village = st.selectbox("村里（臺中市霧峰區）", village_names, index=village_names.index("北勢里"))
-    year = st.selectbox("年份", list(range(this_year, 2018, -1)), index=1)
+    year = st.selectbox("年份", list(range(this_year, 2018, -1)), index=1,
+                        format_func=lambda y: f"{y}" + ("　⚡" if P.cache_path(village, y, 0.5).exists() else ""))
     clear_thr = st.slider("單期最低晴空比例", 0.1, 0.95, 0.5, 0.05,
                           help="村里範圍內 SCL 判定為有效（非雲／雲影／卷雲）之像素比例，低於此值之日期整期剔除；"
                                "保留之日期仍逐像素排除雲遮，再以 SG 插值補齊")
-    season = st.radio("非監督分群之期作", list(SEASONS))
     k = st.slider("K-means 群集數", 3, 8, 5)
     run = st.button("載入影像並分析", type="primary", use_container_width=True)
-    st.caption("影像來源：Microsoft Planetary Computer Sentinel-2 L2A，以 HTTP 視窗讀取，不下載至本機。")
+    st.caption("⚡ 已預先計算（晴空門檻 0.5），可立即載入；其餘年份即時讀取 Planetary Computer 之 "
+               "Sentinel-2 L2A（約 1–3 分鐘），影像不下載至本機。")
 
 if run:
-    st.session_state["params"] = (village, year, clear_thr, season, k)
+    st.session_state["params"] = (village, year, clear_thr, k)
 
-st.title("霧峰區水稻物候階段 Demo")
-st.caption("Sentinel-2 → 雲遮排除 → 非監督稻米判釋 → S2+Month LSTM（SG 插值、seq5）物候階段預測")
+st.title("霧峰區水稻物候監測")
+st.caption("Sentinel-2 時序影像 → 雲遮排除 → 非監督稻米判釋 → LSTM 物候階段 → 收割預報與巡查清單")
 
 if "params" not in st.session_state:
-    st.info("請於左側選擇村里與年份後按「載入影像並分析」。首次載入約需 1–3 分鐘（視村里面積與網路而定）。")
+    st.info("請於左側選擇村里與年份後按「載入影像並分析」。")
     show_map([], {"geom_4326": villages[villages.VILLAGE == village].geometry.iloc[0]}, key="preview")
     st.stop()
 
-village, year, clear_thr, season, k = st.session_state["params"]
+params = st.session_state["params"]
+village, year, clear_thr, k = params
 
 try:
     data = get_cube(village, year, clear_thr)
-    season_idx, labels_map, curves, counts, suggested = cached_clusters(village, year, clear_thr, season, k, data)
+    clusters = cached_clusters(village, year, clear_thr, k, data)
 except RuntimeError as e:
     st.error(str(e))
     st.stop()
 
+rice_widget_key = lambda s: f"rice_{s}_{params}"
+rice_ids = {s: st.session_state.get(rice_widget_key(s), c["suggested"]) for s, c in clusters.items()}
+rice_key = tuple(sorted((s, tuple(sorted(v))) for s, v in rice_ids.items()))
+ana = cached_analysis(village, year, clear_thr, k, rice_key, data, clusters)
+
 slot_dates, slot_acq, acq_df, vmask = data["slot_dates"], data["slot_acq"], data["acq_df"], data["vmask"]
-n_used = sum(a is not None for a in slot_acq)
+n_pre = data["n_pre"]
+pred_dates = ana["pred_dates"]
+rows, cols = ana["rows"], ana["cols"]
+shape = vmask.shape
+seasons = list(ana["cal"])
 
 st.subheader(f"{village}・{year} 年")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("搜尋到之影像日期", len(acq_df))
-c2.metric("達晴空門檻", int((acq_df.clear_frac >= clear_thr).sum()))
-c3.metric("採用期別", f"{n_used} / {len(slot_dates)}")
-c4.metric("村里面積", f"{vmask.sum() * P.GRID_RES ** 2 / 1e4:,.0f} ha")
+st.caption(f"資料：{data['source']}；當年採用 {sum(a is not None for a in slot_acq[n_pre:])} / "
+           f"{len(pred_dates)} 期影像，最新一期 {pred_dates[-1]}")
 
-tab1, tab2, tab3 = st.tabs(["① 影像篩選與雲遮", "② 非監督稻米判釋", "③ LSTM 物候階段"])
+if len(rows) == 0:
+    st.warning("目前沒有判釋為水稻的像素，請到「🔧 技術細節」選擇水稻群集。")
 
-# ---------- ① 影像篩選 ----------
-with tab1:
+tabA, tabB, tabC, tabD, tabE = st.tabs(["📊 種植概況", "📅 收割時程與預報", "⚠️ 巡查清單",
+                                        "🎞 物候動態", "🔧 技術細節"])
+
+# ---------- 📊 種植概況 ----------
+with tabA:
+    planted = {s: planted_mask(ana, s) for s in seasons}
+    cols_m = st.columns(len(seasons) + 2)
+    for i, s in enumerate(seasons):
+        cols_m[i].metric(f"{s}稻作面積", f"{planted[s].sum() * PX_HA:,.1f} ha")
+    if len(seasons) == 2:
+        both = planted[seasons[0]] & planted[seasons[1]]
+        cols_m[-2].metric("兩期皆種", f"{both.sum() * PX_HA:,.1f} ha")
+    cols_m[-1].metric("村里面積", f"{vmask.sum() * PX_HA:,.0f} ha")
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("**種植型態**")
+        code = np.full(len(rows), -1, dtype=np.int16)
+        if len(seasons) == 2:
+            p1, p2 = planted[seasons[0]], planted[seasons[1]]
+            code[p1 & ~p2], code[~p1 & p2], code[p1 & p2] = 0, 1, 2
+        elif seasons:
+            code[planted[seasons[0]]] = 0 if seasons[0] == "一期作" else 1
+        pattern = to_grid(code, rows, cols, shape, -1, np.int16)
+        show_map([(categorical_rgba(pattern, PATTERN_COLORS, -1), 0.85, "種植型態")], data,
+                 key=f"pattern_{rice_key}")
+        legend(list(zip(PATTERN_NAMES, PATTERN_COLORS)))
+    with right:
+        st.markdown("**歷年比較**")
+        summaries = [s for y in range(2017, this_year + 1) if (s := load_summary(village, y))]
+        if len(summaries) >= 2:
+            fig = go.Figure()
+            for s, color in zip(I.SEASONS, ["#F2C14E", "#5AB4E5"]):
+                fig.add_bar(x=[x["year"] for x in summaries],
+                            y=[x["seasons"].get(s, {}).get("稻作面積 (ha)") for x in summaries],
+                            name=s, marker_color=color,
+                            marker_line=dict(width=[3 if x["year"] == year else 0 for x in summaries],
+                                             color="#FF4B4B"))
+            fig.update_layout(barmode="group", height=300, yaxis_title="稻作面積 (ha)",
+                              margin=dict(t=10, b=10), legend=dict(orientation="h", y=1.15),
+                              xaxis=dict(dtick=1))
+            st.plotly_chart(fig, use_container_width=True)
+            tbl = pd.DataFrame([{
+                "年份": x["year"], "期作": s,
+                "面積 (ha)": v["稻作面積 (ha)"],
+                "插秧": v["插秧中位數"][5:], "抽穗": v["抽穗中位數"][5:], "收割": v["收割中位數"][5:],
+            } for x in summaries for s, v in x["seasons"].items()])
+            st.dataframe(tbl, hide_index=True, use_container_width=True, height=260)
+            st.caption("日期為村里內稻作像素之中位數（月/日）。歷年資料由 scripts/precompute.py 以預設參數產生。")
+        else:
+            st.info("執行 `python scripts/precompute.py --village " + village +
+                    " --years 2019 2025` 產生歷年資料後，此處會顯示跨年比較。")
+
+# ---------- 📅 收割時程與預報 ----------
+with tabB:
+    if not seasons or len(rows) == 0:
+        st.info("沒有可分析之期作。")
+    else:
+        season = st.radio("期作", seasons, horizontal=True, key="season_B")
+        cal, ins = ana["cal"][season], ana["in_season"][season]
+        plantedS = planted_mask(ana, season)
+        summ = I.season_summary(cal, ins)
+        live = None
+        if not ana["complete"][season]:
+            live = cached_asof(village, year, clear_thr, k, rice_key, season, pred_dates[-1], data, ana)
+            harvest_all = np.where(plantedS & (cal["收割"] >= 0), cal["收割"], np.where(plantedS, live["forecast"], -1))
+            ok = harvest_all >= 0
+            summ["收割中位數"] = I.ordinal_to_str(np.median(harvest_all[ok])) if ok.any() else "—"
+        c = st.columns(4)
+        for col, ev in zip(c, I.EVENTS):
+            label = f"{ev}（中位數{'，含預報' if live is not None and ev == '收割' else ''}）"
+            col.metric(label, summ[f"{ev}中位數"])
+
+        left, right = st.columns([1, 1])
+        with left:
+            ev = st.radio("日曆圖層", ["插秧", "抽穗", "收割"], horizontal=True, key="cal_layer")
+            ords = np.where(plantedS, cal[ev], -1)
+            if ev == "插秧":
+                ords = np.where(cal["censored"], -1, ords)
+            rgba, items = date_rgba(to_grid(ords, rows, cols, shape))
+            show_map([(rgba, 0.9, f"{ev}日")], data, key=f"cal_{season}_{ev}_{rice_key}", height=460)
+            legend(items)
+            st.caption("日期為首次判定進入該階段之期別（解析度約 10–15 天）。"
+                       + ("插秧發生於當年第 1 期之前者不計。" if ev == "插秧" else ""))
+        with right:
+            st.markdown("**每週收割面積**")
+            fig = go.Figure()
+            week_bars(fig, I.weekly_area(np.where(plantedS, cal["收割"], -1), PX_HA), "已判定收割", "#E3B23C")
+            if live is not None:
+                week_bars(fig, I.weekly_area(live["forecast"], PX_HA), "預報（尚未收割）", "#E53935", 0.75)
+            fig.update_layout(barmode="stack", height=380, yaxis_title="面積 (ha)",
+                              margin=dict(t=10, b=10), legend=dict(orientation="h", y=1.1))
+            st.plotly_chart(fig, use_container_width=True)
+            if live is not None:
+                st.success(f"截至 {pred_dates[-1]}，尚有 {live['n_pending'] * PX_HA:,.1f} ha 未收割；"
+                           "紅色為依目前物候階段推估之收割週。")
+            st.caption("可用於收割機、烘乾廠排程，以及收割後稻草露天燃燒之稽查時段規劃。")
+
+        st.divider()
+        st.markdown("#### 預報可信度回測：假設今天是……")
+        st.caption("只用所選日期以前的影像重新插值與預測，推估各田收割日，再與事後完整資料判定之收割日比較。"
+                   "後續各階段天數採前一年同期作之實際天數（無資料時用預設值）。")
+        if not ana["complete"][season]:
+            st.info("本期作尚未結束，完成後即可回測。")
+        else:
+            (m0, d0), (m1, d1) = I.SEASONS[season]
+            opts = [d for d in pred_dates if date(year, m0, d0) + timedelta(days=30) <= d < date(year, m1, d1)]
+            harvest_med = summ["收割中位數"]
+            target = (date.fromisoformat(harvest_med) - timedelta(days=45)) if harvest_med != "—" else opts[len(opts) // 2]
+            default = min(opts, key=lambda d: abs((d - target).days)) if opts else None
+            if not opts:
+                st.info("可回測之期別不足。")
+            else:
+                asof = st.select_slider("截至日期", options=opts, value=default,
+                                        format_func=lambda d: d.strftime("%Y-%m-%d"), key=f"asof_{season}")
+                r = cached_asof(village, year, clear_thr, k, rice_key, season, asof, data, ana)
+                c = st.columns(4)
+                c[0].metric("需預報面積", f"{r['n_pending'] * PX_HA:,.1f} ha")
+                c[1].metric("平均絕對誤差", f"{r['mae']:.1f} 天" if r["mae"] is not None else "—")
+                c[2].metric("平均偏差", f"{r['bias']:+.1f} 天" if r["bias"] is not None else "—",
+                            help="正值＝預報較實際晚")
+                c[3].metric("誤差 ±15 天內", f"{r['within15']:.0%}" if r["within15"] is not None else "—")
+                fig = go.Figure()
+                week_bars(fig, I.weekly_area(r["forecast"], PX_HA), f"預報（{asof:%m/%d} 時）", "#E53935", 0.8)
+                week_bars(fig, I.weekly_area(r["observed"], PX_HA), "事後判定", "#E3B23C", 0.8)
+                fig.update_layout(barmode="group", height=320, yaxis_title="面積 (ha)",
+                                  margin=dict(t=10, b=10), legend=dict(orientation="h", y=1.12))
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("採用天數：" + "、".join(f"{a}→下一階段 {v:.0f} 天" for a, v in r["durations"].items())
+                           + f"（{r['source']}）。「事後判定」亦為本系統之判釋結果，非地面調查資料。")
+
+# ---------- ⚠️ 巡查清單 ----------
+with tabC:
+    if not seasons or len(rows) == 0:
+        st.info("沒有可分析之期作。")
+    else:
+        season = st.radio("期作", seasons, horizontal=True, key="season_C")
+        df, amap = cached_anomalies(village, year, clear_thr, k, rice_key, season, data, ana)
+        left, right = st.columns([3, 2])
+        with left:
+            show_map([(categorical_rgba(amap.astype(np.int16) - 1, ANOMALY_COLORS, -1), 0.95, "異常區塊")],
+                     data, key=f"anom_{season}_{rice_key}")
+            legend([(ANOMALY_NAMES[i + 1], c) for i, c in enumerate(ANOMALY_COLORS)])
+        with right:
+            if len(df):
+                agg = df.groupby("類型")["面積 (ha)"].agg(["count", "sum"]).rename(
+                    columns={"count": "區塊數", "sum": "面積 (ha)"}).round(2)
+                st.dataframe(agg, use_container_width=True)
+                st.dataframe(df, hide_index=True, use_container_width=True, height=300)
+                st.download_button("下載巡查清單 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"巡查清單_{village}_{year}_{season}.csv", mime="text/csv")
+            else:
+                st.success("本期作未偵測到需巡查之區塊。")
+        st.caption(f"判定標準：抽穗日較村里中位數晚／早 {I.LATE_DAYS} 天以上為生長落後／提前；"
+                   f"季內 NDVI 峰值穩健 z 分數低於 {I.WEAK_Z} 為生長勢偏弱（可能缺水、病蟲害或災損）；"
+                   f"期作結束仍未進入成熟期者為未進入成熟期。僅列出 ≥ {I.MIN_PATCH_PX * PX_HA:.1f} ha 之連續區塊。")
+
+# ---------- 🎞 物候動態 ----------
+with tabD:
+    if len(rows) == 0:
+        st.info("沒有判釋為水稻的像素。")
+    else:
+        pred = ana["pred"]
+        share = np.stack([[(pred[j] == s).mean() * 100 for s in range(4)] for j in range(pred.shape[0])])
+        interp = [slot_acq[j + n_pre] is None for j in range(len(pred_dates))]
+        fig = go.Figure()
+        for s in range(4):
+            fig.add_scatter(x=pred_dates, y=share[:, s], name=P.STAGE_NAMES[s], mode="lines+markers",
+                            line=dict(color=P.STAGE_COLORS[s], width=3),
+                            marker=dict(size=8, color=["white" if f else P.STAGE_COLORS[s] for f in interp],
+                                        line=dict(color=P.STAGE_COLORS[s], width=2)),
+                            hovertemplate="%{y:.1f}%")
+        fig.update_layout(height=340, yaxis_title="稻米像素中之比例 (%)", yaxis_range=[0, 102],
+                          hovermode="x unified", margin=dict(t=20, b=10),
+                          legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("空心點為該期無可用影像、以 SG 插值補齊後預測。")
+        frames = build_player_frames(village, year, clear_thr, k, rice_key, data, ana)
+        st.iframe(player_html(frames, data["geom_4326"]), height=720)
+
+# ---------- 🔧 技術細節 ----------
+with tabE:
+    st.markdown("#### 影像篩選與雲遮")
     fig = go.Figure()
     for used, name, color in ((False, "未採用", "#B0B0B0"), (True, "採用", "#2E7D32")):
         sub = acq_df[acq_df.used == used]
         fig.add_bar(x=sub.date, y=sub.clear_frac * 100, name=name, marker_color=color)
     fig.add_hline(y=clear_thr * 100, line_dash="dash", line_color="#D32F2F",
                   annotation_text=f"門檻 {clear_thr:.0%}")
-    fig.update_layout(height=320, yaxis_title="村里內晴空比例 (%)", bargap=0.1,
+    fig.update_layout(height=300, yaxis_title="村里內晴空比例 (%)", bargap=0.1,
                       margin=dict(t=20, b=10), legend=dict(orientation="h", y=1.1))
     st.plotly_chart(fig, use_container_width=True)
 
     left, right = st.columns([1, 2])
     with left:
         slot_tbl = pd.DataFrame({
-            "期別": [f"T{i + 1}" for i in range(len(slot_dates))],
+            "期別": [f"前年{i - n_pre}" if i < n_pre else f"T{i - n_pre + 1}" for i in range(len(slot_dates))],
             "名目日期": slot_dates,
-            "採用影像": [a if a is not None else "— 缺（插值補齊）" for a in slot_acq],
+            "採用影像": [str(a) if a is not None else "— 缺（插值補齊）" for a in slot_acq],
             "晴空比例": [f"{acq_df.set_index('date').clear_frac.get(a, np.nan):.0%}" if a else "" for a in slot_acq],
         })
         st.dataframe(slot_tbl, hide_index=True, height=480, use_container_width=True)
+        st.caption(f"前 {n_pre} 期取自前一年年底，作為 LSTM 輸入視窗，使當年第 1 期即有預測。")
     with right:
         avail = [i for i, a in enumerate(slot_acq) if a is not None]
-        pick = st.select_slider("檢視真彩影像", options=avail,
-                                format_func=lambda i: f"T{i + 1}  {slot_acq[i]}")
+        pick = st.select_slider("檢視真彩影像", options=avail, value=avail[-1],
+                                format_func=lambda i: f"{slot_acq[i]}")
         show_map([(true_color_rgba(data["cube"][pick], vmask), 1.0, f"Sentinel-2 {slot_acq[pick]}")],
                  data, key=f"tc_{pick}")
         legend([("雲／雲影／卷雲（已排除）", "rgb(255,64,160)")])
 
-# ---------- ② 稻米判釋 ----------
-with tab2:
-    left, right = st.columns([1, 1])
-    with left:
-        x = [slot_dates[i] for i in season_idx]
-        fig = go.Figure()
-        for c in range(k):
-            fig.add_scatter(x=x, y=curves[c], mode="lines+markers", connectgaps=True,
-                            name=f"Cluster {c}（{counts[c]:,} px）",
-                            line=dict(color=CLUSTER_COLORS[c], width=4 if c in suggested else 2))
-        fig.update_layout(height=380, yaxis_title="平均 NDVI", title=f"各群集平均 NDVI 時序（{season}）",
-                          margin=dict(t=50, b=10), legend=dict(font=dict(size=11)))
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("水稻典型曲線：淹水低點 → 陡升 → 高峰 → 緩降。系統依振幅、峰值與低點先於峰值自動建議，可自行調整。")
-        rice_ids = st.multiselect("水稻群集", list(range(k)), default=suggested,
-                                  format_func=lambda c: f"Cluster {c}", key=f"rice_{st.session_state['params']}")
-        rice_px = int(np.isin(labels_map, rice_ids).sum())
-        st.metric("稻米像素 / 面積", f"{rice_px:,} px", f"約 {rice_px * P.GRID_RES ** 2 / 1e4:,.1f} ha",
-                  delta_color="off")
-    with right:
-        view = st.radio("圖層", ["稻米遮罩", "全部群集"], horizontal=True)
-        if view == "稻米遮罩":
-            rice_map = np.where(labels_map < 0, -1, np.isin(labels_map, rice_ids).astype(np.int16))
-            rgba = categorical_rgba(rice_map, ["#BDBDBD", "#00E676"], -1)
-            rgba[rice_map == 0, 3] = 90
-            show_map([(rgba, 0.85, "稻米遮罩")], data, key=f"ricemap_{rice_ids}")
-            legend([("水稻", "#00E676"), ("非水稻", "#BDBDBD")])
-        else:
-            show_map([(categorical_rgba(labels_map, CLUSTER_COLORS[:k], -1), 0.85, "K-means 群集")],
-                     data, key="clusters")
-            legend([(f"Cluster {c}", CLUSTER_COLORS[c]) for c in range(k)])
-
-# ---------- ③ 物候階段 ----------
-with tab3:
-    if not rice_ids:
-        st.warning("請先於「② 非監督稻米判釋」選擇至少一個水稻群集。")
-        st.stop()
-    stage_maps = cached_stages(village, year, clear_thr, season, k, tuple(sorted(rice_ids)), data, labels_map)
-    pred_dates = slot_dates[P.SEQ_LEN:]
-    rice_mask = stage_maps[0] != 255
-    n_rice = int(rice_mask.sum())
-
-    share = np.stack([[(sm[rice_mask] == s).mean() * 100 for s in range(4)] for sm in stage_maps])
-    fig = go.Figure()
-    interp = [slot_acq[j + P.SEQ_LEN] is None for j in range(len(pred_dates))]
-    for s in range(4):
-        fig.add_scatter(x=pred_dates, y=share[:, s], name=P.STAGE_NAMES[s], mode="lines+markers",
-                        line=dict(color=P.STAGE_COLORS[s], width=3),
-                        marker=dict(size=8, color=["white" if f else P.STAGE_COLORS[s] for f in interp],
-                                    line=dict(color=P.STAGE_COLORS[s], width=2)),
-                        hovertemplate="%{y:.1f}%")
-    fig.update_layout(height=360, yaxis_title="判釋稻米像素中之比例 (%)", yaxis_range=[0, 102],
-                      hovermode="x unified", margin=dict(t=20, b=10),
-                      legend=dict(orientation="h", y=1.12))
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"以前 {P.SEQ_LEN} 期為輸入視窗預測下一期之階段，故自第 {P.SEQ_LEN + 1} 期起才有預測。"
-               "空心點為該期無可用影像、以 SG 插值補齊後預測。")
-
-    frames = build_player_frames(village, year, clear_thr, season, k, tuple(sorted(rice_ids)),
-                                 data, stage_maps)
-    st.iframe(player_html(frames, data["geom_4326"]), height=720)
+    st.markdown("#### 非監督稻米判釋（各期作分別分群）")
+    cols_s = st.columns(max(len(clusters), 1))
+    for col, (s, c) in zip(cols_s, clusters.items()):
+        with col:
+            x = [slot_dates[i] for i in c["idx"]]
+            fig = go.Figure()
+            for ci in range(k):
+                fig.add_scatter(x=x, y=c["curves"][ci], mode="lines+markers", connectgaps=True,
+                                name=f"Cluster {ci}（{c['counts'][ci]:,} px）",
+                                line=dict(color=CLUSTER_COLORS[ci], width=4 if ci in rice_ids[s] else 2))
+            fig.update_layout(height=330, yaxis_title="平均 NDVI", title=f"{s}：各群集平均 NDVI",
+                              margin=dict(t=50, b=10), legend=dict(font=dict(size=10)))
+            st.plotly_chart(fig, use_container_width=True)
+            st.multiselect(f"{s}水稻群集", list(range(k)), default=c["suggested"],
+                           format_func=lambda ci: f"Cluster {ci}", key=rice_widget_key(s))
+    st.caption("水稻典型曲線：淹水低點 → 陡升 → 高峰 → 緩降。系統依振幅、峰值與低點先於峰值自動建議（粗線），可自行調整。")
     st.caption("模型：S2+Month LSTM（SG 插值、seq5），models/model_S2plusMonth.pt")

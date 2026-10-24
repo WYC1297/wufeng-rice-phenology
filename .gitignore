@@ -9,3 +9,4 @@ venv/
 *.aux.xml
 .DS_Store
 Thumbs.db
+cache/
