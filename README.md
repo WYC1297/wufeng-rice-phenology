@@ -138,3 +138,7 @@ docs/                       README 圖片
 - Sentinel-2 L2A：Copernicus Sentinel data，經 [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/) 取得
 - 村里界：內政部國土測繪中心 村里界圖（政府資料開放授權條款）
 - 底圖：Esri World Imagery、OpenStreetMap
+
+## 授權
+
+程式碼以 [MIT License](LICENSE) 釋出；Sentinel-2 影像與村里界依各自之資料授權條款。
