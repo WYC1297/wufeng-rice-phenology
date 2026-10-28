@@ -55,7 +55,7 @@ def get_cube(village, year, clear_thr):
             data["source"] = "即時讀取 Planetary Computer"
         ndvi, ndwi, rvi = P.spectral_indices(data["cube"])
         data.update(ndvi=ndvi, ndwi=ndwi, rvi=rvi)
-        while len(store) >= 2:
+        while store:   # 只保留一組，降低雲端主機記憶體用量
             store.pop(next(iter(store)))
         store[key] = data
     return store[key]
@@ -391,7 +391,7 @@ with st.sidebar:
                           help="村里範圍內 SCL 判定為有效（非雲／雲影／卷雲）之像素比例，低於此值之日期整期剔除；"
                                "保留之日期仍逐像素排除雲遮，再以 SG 插值補齊")
     k = st.slider("K-means 群集數", 3, 8, 5)
-    run = st.button("載入影像並分析", type="primary", use_container_width=True)
+    run = st.button("載入影像並分析", type="primary", width="stretch")
     st.caption("⚡ 已預先計算（晴空門檻 0.5），可立即載入；其餘年份即時讀取 Planetary Computer 之 "
                "Sentinel-2 L2A（約 1–3 分鐘），影像不下載至本機。")
 
@@ -476,13 +476,13 @@ with tabA:
             fig.update_layout(barmode="group", height=300, yaxis_title="稻作面積 (ha)",
                               margin=dict(t=10, b=10), legend=dict(orientation="h", y=1.15),
                               xaxis=dict(dtick=1))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             tbl = pd.DataFrame([{
                 "年份": x["year"], "期作": s,
                 "面積 (ha)": v["稻作面積 (ha)"],
                 "插秧": v["插秧中位數"][5:], "抽穗": v["抽穗中位數"][5:], "收割": v["收割中位數"][5:],
             } for x in summaries for s, v in x["seasons"].items()])
-            st.dataframe(tbl, hide_index=True, use_container_width=True, height=260)
+            st.dataframe(tbl, hide_index=True, width="stretch", height=260)
             st.caption("日期為村里內稻作像素之中位數（月/日）。歷年資料由 scripts/precompute.py 以預設參數產生。")
         else:
             st.info("執行 `python scripts/precompute.py --village " + village +
@@ -527,7 +527,7 @@ with tabB:
                 week_bars(fig, I.weekly_area(live["forecast"], PX_HA), "預報（尚未收割）", "#E53935", 0.75)
             fig.update_layout(barmode="stack", height=380, yaxis_title="面積 (ha)",
                               margin=dict(t=10, b=10), legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             if live is not None:
                 st.success(f"截至 {pred_dates[-1]}，尚有 {live['n_pending'] * PX_HA:,.1f} ha 未收割；"
                            "紅色為依目前物候階段推估之收割週。")
@@ -562,7 +562,7 @@ with tabB:
                 week_bars(fig, I.weekly_area(r["observed"], PX_HA), "事後判定", "#E3B23C", 0.8)
                 fig.update_layout(barmode="group", height=320, yaxis_title="面積 (ha)",
                                   margin=dict(t=10, b=10), legend=dict(orientation="h", y=1.12))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.caption("採用天數：" + "、".join(f"{a}→下一階段 {v:.0f} 天" for a, v in r["durations"].items())
                            + f"（{r['source']}）。「事後判定」亦為本系統之判釋結果，非地面調查資料。")
 
@@ -582,8 +582,8 @@ with tabC:
             if len(df):
                 agg = df.groupby("類型")["面積 (ha)"].agg(["count", "sum"]).rename(
                     columns={"count": "區塊數", "sum": "面積 (ha)"}).round(2)
-                st.dataframe(agg, use_container_width=True)
-                st.dataframe(df, hide_index=True, use_container_width=True, height=300)
+                st.dataframe(agg, width="stretch")
+                st.dataframe(df, hide_index=True, width="stretch", height=300)
                 st.download_button("下載巡查清單 CSV", df.to_csv(index=False).encode("utf-8-sig"),
                                    file_name=f"巡查清單_{village}_{year}_{season}.csv", mime="text/csv")
             else:
@@ -610,7 +610,7 @@ with tabD:
         fig.update_layout(height=340, yaxis_title="稻米像素中之比例 (%)", yaxis_range=[0, 102],
                           hovermode="x unified", margin=dict(t=20, b=10),
                           legend=dict(orientation="h", y=1.12))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.caption("空心點為該期無可用影像、以 SG 插值補齊後預測。")
         frames = build_player_frames(village, year, clear_thr, k, rice_key, data, ana)
         st.iframe(player_html(frames, data["geom_4326"]), height=720)
@@ -626,7 +626,7 @@ with tabE:
                   annotation_text=f"門檻 {clear_thr:.0%}")
     fig.update_layout(height=300, yaxis_title="村里內晴空比例 (%)", bargap=0.1,
                       margin=dict(t=20, b=10), legend=dict(orientation="h", y=1.1))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     left, right = st.columns([1, 2])
     with left:
@@ -636,7 +636,7 @@ with tabE:
             "採用影像": [str(a) if a is not None else "— 缺（插值補齊）" for a in slot_acq],
             "晴空比例": [f"{acq_df.set_index('date').clear_frac.get(a, np.nan):.0%}" if a else "" for a in slot_acq],
         })
-        st.dataframe(slot_tbl, hide_index=True, height=480, use_container_width=True)
+        st.dataframe(slot_tbl, hide_index=True, height=480, width="stretch")
         st.caption(f"前 {n_pre} 期取自前一年年底，作為 LSTM 輸入視窗，使當年第 1 期即有預測。")
     with right:
         avail = [i for i, a in enumerate(slot_acq) if a is not None]
@@ -658,8 +658,8 @@ with tabE:
                                 line=dict(color=CLUSTER_COLORS[ci], width=4 if ci in rice_ids[s] else 2))
             fig.update_layout(height=330, yaxis_title="平均 NDVI", title=f"{s}：各群集平均 NDVI",
                               margin=dict(t=50, b=10), legend=dict(font=dict(size=10)))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.multiselect(f"{s}水稻群集", list(range(k)), default=c["suggested"],
                            format_func=lambda ci: f"Cluster {ci}", key=rice_widget_key(s))
     st.caption("水稻典型曲線：淹水低點 → 陡升 → 高峰 → 緩降。系統依振幅、峰值與低點先於峰值自動建議（粗線），可自行調整。")
-    st.caption("模型：S2+Month LSTM（SG 插值、seq5），models/model_S2plusMonth.pt")
+    st.caption("模型：S2+Month LSTM（SG 插值、seq5），models/model_S2plusMonth.npz（NumPy 推論）")

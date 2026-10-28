@@ -84,12 +84,13 @@ LSTM 物候階段預測
 ```bash
 python -m venv .venv
 source .venv/bin/activate            # Windows：.venv\Scripts\activate
-pip install --index-url https://download.pytorch.org/whl/cpu torch
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-瀏覽器開啟 http://localhost:8501，於左側選擇村里與年份後按「載入影像並分析」。首次載入約 1–3 分鐘（視村里面積與網路速度而定）。
+瀏覽器開啟 http://localhost:8501，於左側選擇村里與年份後按「載入影像並分析」。標有 ⚡ 之組合（北勢里 2025、2026）已附預先計算之影像時序，約 20 秒內完成；其餘組合即時讀取雲端影像，約 1–3 分鐘（視村里面積與網路速度而定）。
+
+LSTM 推論以 NumPy 實作（`models/model_S2plusMonth.npz`，與 PyTorch 原模型逐像素結果一致），網頁執行不需安裝 torch。
 
 預先計算歷年資料（展示時可立即載入，並啟用跨年比較與以前一年天數預報）：
 
@@ -97,13 +98,18 @@ streamlit run app.py
 python scripts/precompute.py --village 北勢里 --years 2019 2025
 ```
 
-結果存於 `cache/`（不納入版本控制）。
+結果存於 `cache/`。版本控制中僅納入各年度摘要（`*_summary.json`，供跨年比較與預報天數）及北勢里 2025、2026 之影像時序。
 
-輸出靜態成果圖（README 圖片即由此產生）：
+輸出靜態成果圖（README 圖片即由此產生；需另裝 `requirements-dev.txt`）：
 
 ```bash
+pip install -r requirements-dev.txt
 python scripts/export_figures.py --village 北勢里 --year 2025 --out docs --font <中文字型檔.otf>
 ```
+
+### 部署至 Streamlit Community Cloud
+
+於 [share.streamlit.io](https://share.streamlit.io) 以 GitHub 帳號登入 → Create app → 選擇本 repository、分支 `main`、主程式 `app.py`，Advanced settings 之 Python 版本選 3.12 → Deploy。
 
 ## 專案結構
 
@@ -113,7 +119,9 @@ pipeline.py                 影像讀取、雲遮、分群、特徵與 LSTM 推�
 insights.py                 物候日曆、收割預報與回測、巡查清單、年度摘要
 scripts/precompute.py       批次預先計算歷年資料
 scripts/export_figures.py   輸出成果圖與 GIF
-models/                     模型權重與評估指標
+scripts/convert_model.py    PyTorch 權重轉 NumPy
+models/                     模型權重（.pt 原始、.npz 推論用）與評估指標
+cache/                      年度摘要與展示用影像時序
 wufeng_villages.geojson     霧峰區村里界
 docs/                       README 圖片
 ```

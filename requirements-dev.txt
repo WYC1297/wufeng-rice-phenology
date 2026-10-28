@@ -1,0 +1,4 @@
+# 輸出成果圖（scripts/export_figures.py）與權重轉檔（scripts/convert_model.py）
+-r requirements.txt
+matplotlib>=3.9
+torch>=2.2   # 建議 CPU 版：pip install --index-url https://download.pytorch.org/whl/cpu torch

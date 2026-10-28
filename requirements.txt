@@ -1,5 +1,4 @@
-# torch 建議先另外安裝 CPU 版：pip install --index-url https://download.pytorch.org/whl/cpu torch
-torch>=2.2
+# 網頁執行所需（LSTM 以 NumPy 推論，不需 torch）
 streamlit>=1.50
 streamlit-folium>=0.27
 folium>=0.20
@@ -14,4 +13,3 @@ pyogrio>=0.10
 pystac-client>=0.8
 planetary-computer>=1.0
 pillow>=10.0
-matplotlib>=3.9

@@ -29,8 +29,6 @@ import pandas as pd
 import planetary_computer
 import pystac_client
 import rasterio
-import torch
-import torch.nn as nn
 from rasterio.enums import Resampling
 from rasterio.features import geometry_mask
 from rasterio.transform import from_origin
@@ -44,7 +42,8 @@ from sklearn.preprocessing import StandardScaler
 APP_DIR = Path(__file__).resolve().parent
 VILLAGE_GEOJSON = APP_DIR / "wufeng_villages.geojson"
 # 來源：phenology_stage_lstm/lstm_phenology_models_s2interp_sg_seq5_完整/model_S2plusMonth.pt
-MODEL_PATH = APP_DIR / "models" / "model_S2plusMonth.pt"
+# 以 scripts/convert_model.py 轉為 NumPy 權重，推論不需安裝 torch
+MODEL_PATH = APP_DIR / "models" / "model_S2plusMonth.npz"
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "sentinel-2-l2a"
@@ -449,35 +448,58 @@ def cluster_village(ndvi: np.ndarray, vmask: np.ndarray, season_idx, n_clusters:
 
 # ============ LSTM 物候預測 ============
 
-class LSTMModel(nn.Module):
-    """與 train_s2interp_all_methods.py 相同之架構"""
-    def __init__(self, input_size, lstm_units=128, num_layers=2, dropout_rate=0.2, output_classes=4):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=input_size, hidden_size=lstm_units,
-                            num_layers=num_layers, batch_first=True,
-                            dropout=dropout_rate if num_layers > 1 else 0)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(lstm_units, 32)
-        self.fc2 = nn.Linear(32, output_classes)
-        self.relu = nn.ReLU()
+class LSTMModel:
+    """
+    與 train_s2interp_all_methods.py 相同之架構（2 層 LSTM 128 → fc 32 → ReLU → fc 4），
+    以 NumPy 實作推論；閘門順序同 PyTorch (i, f, g, o)，dropout 於推論時不作用
+    """
+    def __init__(self, weights: dict, num_layers: int = 2):
+        w = {k: v.astype(np.float32) for k, v in weights.items()}
+        # sigmoid(x) = 0.5·tanh(x/2) + 0.5：i、f、o 閘之權重先乘 0.5，四個閘只需一次 tanh
+        hidden = w["lstm__weight_hh_l0"].shape[1]
+        scale = np.full(4 * hidden, 0.5, np.float32)
+        scale[2 * hidden:3 * hidden] = 1.0
+        self.layers = []
+        for layer in range(num_layers):
+            self.layers.append((
+                np.ascontiguousarray((w[f"lstm__weight_ih_l{layer}"] * scale[:, None]).T),
+                np.ascontiguousarray((w[f"lstm__weight_hh_l{layer}"] * scale[:, None]).T),
+                (w[f"lstm__bias_ih_l{layer}"] + w[f"lstm__bias_hh_l{layer}"]) * scale,
+            ))
+        self.w = w
 
-    def forward(self, x):
-        x, _ = self.lstm(x)
-        x = self.dropout(x)
-        x = x[:, -1, :]
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        return self.fc2(x)
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        """x (N, T, F) → logits (N, 4)"""
+        h_seq = np.ascontiguousarray(x.transpose(1, 0, 2), dtype=np.float32)   # (T, N, F)
+        for w_ih, w_hh, bias in self.layers:
+            hidden = w_hh.shape[0]
+            t_len, n, _ = h_seq.shape
+            h = np.zeros((n, hidden), np.float32)
+            c = np.zeros((n, hidden), np.float32)
+            gates_x = h_seq @ w_ih + bias
+            outs = np.empty((t_len, n, hidden), np.float32)
+            for t in range(t_len):
+                g = gates_x[t]
+                g += h @ w_hh
+                np.tanh(g, out=g)
+                g *= 0.5
+                g[:, 2 * hidden:3 * hidden] *= 2.0
+                g[:, :2 * hidden] += 0.5
+                g[:, 3 * hidden:] += 0.5
+                i, f, gg, o = (g[:, k * hidden:(k + 1) * hidden] for k in range(4))
+                c *= f
+                c += i * gg
+                h = outs[t]
+                np.tanh(c, out=h)
+                h *= o
+            h_seq = outs
+        z = np.maximum(h_seq[-1] @ self.w["fc1__weight"].T + self.w["fc1__bias"], 0)
+        return z @ self.w["fc2__weight"].T + self.w["fc2__bias"]
 
 
-def load_model(path: Path = MODEL_PATH) -> nn.Module:
-    model = LSTMModel(input_size=5)
-    state = torch.load(path, map_location="cpu")
-    state = {k.removeprefix("module."): v for k, v in state.items()}
-    model.load_state_dict(state)
-    model.eval()
-    return model
+def load_model(path: Path = MODEL_PATH) -> LSTMModel:
+    with np.load(path) as f:
+        return LSTMModel(dict(f))
 
 
 def _normalize(x: np.ndarray, name: str) -> np.ndarray:
@@ -505,8 +527,7 @@ def build_s2_month_series(ndvi, ndwi, rvi, rice_rows, rice_cols, slot_dates) -> 
     return np.stack(feats, axis=2).astype(np.float32)
 
 
-@torch.no_grad()
-def predict_stages(model: nn.Module, series: np.ndarray, batch_size: int = 16384) -> np.ndarray:
+def predict_stages(model: LSTMModel, series: np.ndarray, batch_size: int = 16384) -> np.ndarray:
     """
     series (N, T, 5) → (T - SEQ_LEN, N)，第 j 列為期別 j + SEQ_LEN 之預測階段
     （訓練時以 [i, i+seq) 視窗預測 T{i+seq+1} 之標籤）
@@ -517,7 +538,7 @@ def predict_stages(model: nn.Module, series: np.ndarray, batch_size: int = 16384
         window = series[:, end - SEQ_LEN:end]
         preds = []
         for b in range(0, N, batch_size):
-            logits = model(torch.from_numpy(np.ascontiguousarray(window[b:b + batch_size])))
-            preds.append(logits.argmax(1).numpy())
+            logits = model(window[b:b + batch_size])
+            preds.append(logits.argmax(1).astype(np.uint8))
         out[j] = np.concatenate(preds) if preds else np.empty(0, dtype=np.uint8)
     return out

@@ -9,4 +9,8 @@ venv/
 *.aux.xml
 .DS_Store
 Thumbs.db
-cache/
+# 預先計算快取：僅納入年度摘要與展示用之北勢里 2025、2026 影像時序
+cache/*
+!cache/*_summary.json
+!cache/北勢里_2025_clear50.pkl.gz
+!cache/北勢里_2026_clear50.pkl.gz
