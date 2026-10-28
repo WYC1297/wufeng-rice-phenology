@@ -1,5 +1,9 @@
 # 霧峰區水稻物候監測
 
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://wufeng-rice-phenology.streamlit.app/)
+
+**線上 Demo：<https://wufeng-rice-phenology.streamlit.app/>**（選北勢里 2025 或 2026 可立即載入）
+
 以 Sentinel-2 時序影像，自動判釋臺中市霧峰區各村里的水稻田，以 LSTM 預測每一期的水稻物候階段（營養生長期／生殖生長期／成熟期／非稻作），並進一步轉換成可供決策的資訊：
 
 - **種了多少稻**：各期作稻作面積、種植型態（一期／二期／兩期皆種）、歷年比較
